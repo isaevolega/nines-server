@@ -7,12 +7,24 @@ export class Room {
   public id: string;
   public state: RoomState;
   private timerInterval: NodeJS.Timeout | null = null;
+  private skipTimerInterval: NodeJS.Timeout | null = null;
   private disconnectTimers: Map<string, NodeJS.Timeout> = new Map();
-  private roomTimeout: NodeJS.Timeout | null = null; // Таймер жизни комнаты (1 час)
-  private eliminationOrder: string[] = []; // Порядок выбывания игроков (для ранжирования)
+  private roomTimeout: NodeJS.Timeout | null = null;
+  private eliminationOrder: string[] = [];
+  
+  // 🔥 Callback'и для отправки данных клиентам (передаются из server.ts)
+  private onGameStateUpdate: (room: Room) => void;
+  private onNotificationBroadcast: (room: Room, message: string, severity: string) => void;
 
-  constructor(id: string, organizer: Player) {
+  constructor(
+    id: string, 
+    organizer: Player,
+    onGameStateUpdate: (room: Room) => void,
+    onNotificationBroadcast: (room: Room, message: string, severity: string) => void
+  ) {
     this.id = id;
+    this.onGameStateUpdate = onGameStateUpdate;
+    this.onNotificationBroadcast = onNotificationBroadcast;
     this.state = {
       roomId: id,
       players: [organizer],
@@ -24,7 +36,6 @@ export class Room {
       createdAt: Date.now(),
     };
 
-    // Запускаем таймер удаления комнаты через 1 час
     this.startRoomTimeout();
   }
 
@@ -40,13 +51,11 @@ export class Room {
     
     this.state.gameOver = true;
     if (this.timerInterval) clearInterval(this.timerInterval);
+    if (this.skipTimerInterval) clearInterval(this.skipTimerInterval);
     if (this.roomTimeout) clearTimeout(this.roomTimeout);
-
-    // Формируем ранжирование по текущему состоянию
-    const rankings = this.calculateRankings();
     
-    // Сервер должен отправить game_over (вызывается из server.ts через callback)
-    // Здесь только логика
+    // Отправляем финальное состояние
+    this.broadcastGameState();
   }
 
   public getRankings(): { playerId: string; place: number }[] {
@@ -56,12 +65,10 @@ export class Room {
   private calculateRankings(): { playerId: string; place: number }[] {
     const activePlayers = this.state.players.filter(p => p.status !== 'left');
     
-    // Сортировка: сначала по количеству карт (меньше = лучше), затем по порядку выбывания
     const sorted = [...activePlayers].sort((a, b) => {
       if (a.cardCount !== b.cardCount) {
         return a.cardCount - b.cardCount;
       }
-      // При равенстве карт: кто раньше выбыл (меньше индекс в eliminationOrder) — тот лучше
       const aIndex = this.eliminationOrder.indexOf(a.id);
       const bIndex = this.eliminationOrder.indexOf(b.id);
       if (aIndex !== -1 && bIndex !== -1) return aIndex - bIndex;
@@ -84,7 +91,6 @@ export class Room {
     if (existing) {
       existing.status = 'active';
       existing.socketId = player.socketId;
-      // Отменяем таймер дисконнекта
       if (this.disconnectTimers.has(player.id)) {
         clearTimeout(this.disconnectTimers.get(player.id)!);
         this.disconnectTimers.delete(player.id);
@@ -99,12 +105,11 @@ export class Room {
     const player = this.state.players.find(p => p.id === playerId);
     if (player) {
       player.status = 'offline';
-      // По ТЗ: через 10 сек помечает как «Не в сети». Авто-ходы работают.
+      this.broadcastGameState(); // Обновляем статус для всех
     }
   }
 
   scheduleDisconnect(playerId: string, callback: () => void): void {
-    // Если уже есть таймер — сбрасываем
     if (this.disconnectTimers.has(playerId)) {
       clearTimeout(this.disconnectTimers.get(playerId)!);
     }
@@ -112,7 +117,7 @@ export class Room {
       this.markDisconnected(playerId);
       callback();
       this.disconnectTimers.delete(playerId);
-    }, 10000); // 10 секунд по ТЗ
+    }, 10000);
     this.disconnectTimers.set(playerId, timer);
   }
 
@@ -138,7 +143,7 @@ export class Room {
     this.state.gameOver = false;
     this.state.firstMoveAutoPlayed = false;
     this.state.turnIndex = 0;
-    this.eliminationOrder = []; // Сброс порядка выбывания
+    this.eliminationOrder = [];
 
     this.executeFirstAutoMove();
     
@@ -161,18 +166,22 @@ export class Room {
         playerWith9Diamonds.cardCount = playerWith9Diamonds.hand.length;
         
         this.state.firstMoveAutoPlayed = true;
-        // Ход переходит к следующему игроку после авто-хода 9♦
         this.state.turnIndex = (playerIndex + 1) % this.state.players.length;
+        
+        console.log(`[AUTO] Первый ход: ${playerWith9Diamonds.name} сыграл 9♦`);
       }
     } else {
       this.state.firstMoveAutoPlayed = true;
       this.state.turnIndex = 0;
     }
     
+    // Отправляем состояние после авто-хода
+    this.broadcastGameState();
+    
+    // Запускаем таймер для следующего игрока
     this.startTurnTimer();
   }
 
-  // 🔥 НОВЫЙ метод: найти текущего активного игрока
   private getCurrentActivePlayer(): Player | undefined {
     let attempts = 0;
     while (attempts < this.state.players.length) {
@@ -180,7 +189,6 @@ export class Room {
       if (player && player.status === 'active') {
         return player;
       }
-      // Пропускаем неактивного
       this.state.turnIndex = (this.state.turnIndex + 1) % this.state.players.length;
       attempts++;
     }
@@ -213,17 +221,16 @@ export class Room {
 
     console.log('[PLAY] Ход успешен, карт осталось:', currentPlayer.cardCount);
 
-    // Проверка победы
+    // 🔥 Проверка победы
     if (currentPlayer.cardCount === 0) {
       console.log('[PLAY] Победа!', playerId);
-      this.eliminationOrder.push(playerId); // Фиксируем победителя первым
+      this.eliminationOrder.push(playerId);
       this.endGame(currentPlayer.id);
       return { success: true };
     }
 
-    // Передаём ход следующему игроку
+    // 🔥 Передаём ход и отправляем обновление
     this.advanceTurn();
-
     return { success: true };
   }
 
@@ -234,25 +241,28 @@ export class Room {
       return { success: false, message: 'Сейчас не ваш ход' };
     }
 
-    // Проверка: можно пропускать только если нет валидных ходов
     const validMoves = getValidMoves(currentPlayer.hand, this.state.piles);
     if (validMoves.length > 0) {
       return { success: false, message: 'Есть доступные ходы' };
     }
 
-    console.log('[SKIP] Игрок пропустил ход:', playerId);
-    this.advanceTurn();
+    console.log(`[SKIP] Игрок ${currentPlayer.name} нажал кнопку пропуска`);
+    this.handleSkipTurn(playerId);
     return { success: true };
   }
 
   private startTurnTimer(): void {
+    // Очищаем старые таймеры
     if (this.timerInterval) {
-      console.log('[TIMER] Очищаем старый таймер');
       clearInterval(this.timerInterval);
+      this.timerInterval = null;
+    }
+    if (this.skipTimerInterval) {
+      clearInterval(this.skipTimerInterval);
+      this.skipTimerInterval = null;
     }
 
     const currentPlayer = this.getCurrentActivePlayer();
-
     if (!currentPlayer || this.state.gameOver) {
       this.state.timer = 0;
       return;
@@ -260,42 +270,84 @@ export class Room {
 
     const validMoves = getValidMoves(currentPlayer.hand, this.state.piles);
     
-    console.log(`[TIMER] Игрок ${currentPlayer.name}, ходов: ${validMoves.length}`);
+    console.log(`[TIMER] Игрок ${currentPlayer.name}, валидных ходов: ${validMoves.length}`);
     
     if (validMoves.length === 0) {
-      console.log('[TIMER] Нет ходов — мгновенный пропуск');
-      this.state.timer = 0;
-      this.advanceTurn(); // 🔥 Не рекурсия, а один вызов
+      // 🔥 НЕТ ВАЛИДНЫХ ХОДОВ — таймер 10 секунд + кнопка «Пропустить»
+      console.log('[TIMER] Нет ходов — запускаем таймер пропуска (10 сек)');
+      this.state.timer = 10;
+      
+      this.skipTimerInterval = setInterval(() => {
+        if (this.state.timer > 0) {
+          this.state.timer--;
+          console.log(`[SKIP_TIMER] ${currentPlayer.name}: ${this.state.timer} сек до пропуска`);
+          
+          this.broadcastGameState();
+        } else {
+          console.log('[SKIP_TIMER] Таймер пропуска истёк — автоматический пропуск');
+          this.handleSkipTurn(currentPlayer.id);
+        }
+      }, 1000);
+      
+      this.broadcastGameState();
+    } else {
+      // 🔥 ЕСТЬ ВАЛИДНЫЕ ХОДЫ — таймер 30 секунд + авто-ход
+      console.log('[TIMER] Есть ходы — запускаем таймер хода (30 сек)');
+      this.state.timer = 30;
+      
+      this.timerInterval = setInterval(() => {
+        if (this.state.timer > 0) {
+          this.state.timer--;
+          console.log(`[TIMER] ${currentPlayer.name}: ${this.state.timer} сек`);
+          
+          this.broadcastGameState();
+        } else {
+          console.log('[TIMER] Таймер хода истёк — автоматический ход');
+          this.handleTimerEnd();
+        }
+      }, 1000);
+      
+      this.broadcastGameState();
+    }
+  }
+
+  private handleSkipTurn(playerId: string): void {
+    if (this.skipTimerInterval) {
+      clearInterval(this.skipTimerInterval);
+      this.skipTimerInterval = null;
+    }
+
+    const currentPlayer = this.getCurrentActivePlayer();
+    if (!currentPlayer || currentPlayer.id !== playerId) {
+      console.log('[SKIP] Неверный игрок для пропуска');
       return;
     }
 
-    this.state.timer = 30;
-    console.log('[TIMER] Запускаем таймер на 30 сек');
+    console.log(`[SKIP] Игрок ${currentPlayer.name} пропустил ход`);
     
-    this.timerInterval = setInterval(() => {
-      if (this.state.timer > 0) {
-        this.state.timer--;
-      } else {
-        console.log('[TIMER] Таймер истёк');
-        this.handleTimerEnd();
-      }
-    }, 1000);
+    // 🔥 Уведомление всем игрокам о пропуске
+    this.broadcastNotification(`${currentPlayer.name}: нет доступных ходов`, 'info');
+    
+    // Передаём ход следующему
+    this.advanceTurn();
   }
 
-  // 🔥 ИСПРАВЛЕННЫЙ метод: turnIndex теперь индекс в полном массиве
+  private broadcastGameState(): void {
+    console.log('[BROADCAST] Вызов callback для отправки game_state');
+    this.onGameStateUpdate(this);
+  }
+
   private advanceTurn(): void {
     console.log('[TURN] До переключения: turnIndex =', this.state.turnIndex);
     
-    // Переключаем на следующего игрока в полном массиве
     this.state.turnIndex = (this.state.turnIndex + 1) % this.state.players.length;
     
-    // Пропускаем неактивных игроков
     let attempts = 0;
     while (attempts < this.state.players.length) {
       const player = this.state.players[this.state.turnIndex];
       if (player && player.status === 'active') {
         console.log('[TURN] Найден активный игрок:', player.name);
-        break; // Нашли активного
+        break;
       }
       console.log('[TURN] Пропускаем неактивного:', player?.name || 'undefined');
       this.state.turnIndex = (this.state.turnIndex + 1) % this.state.players.length;
@@ -304,35 +356,77 @@ export class Room {
     
     console.log('[TURN] После переключения: turnIndex =', this.state.turnIndex);
     
-    // Запускаем таймер для следующего игрока
+    // 🔥 Отправляем обновление перед запуском таймера
+    this.broadcastGameState();
+    
     this.startTurnTimer();
   }
 
   private handleTimerEnd(): void {
-    if (this.timerInterval) clearInterval(this.timerInterval);
+    if (this.timerInterval) {
+      clearInterval(this.timerInterval);
+      this.timerInterval = null;
+    }
     
     const currentPlayer = this.getCurrentActivePlayer();
-
     if (!currentPlayer) return;
 
     const validMoves = getValidMoves(currentPlayer.hand, this.state.piles);
+    
     if (validMoves.length > 0) {
       // Авто-ход случайной картой
-      const randomCard = validMoves[Math.floor(Math.random() * validMoves.length)];
-      console.log('[AUTO] Автоматический ход:', randomCard);
-      this.playCard(currentPlayer.id, randomCard); // playCard вызовет advanceTurn()
-    } else {
-      // Авто-пропуск
-      console.log('[AUTO] Автоматический пропуск');
+      const randomIndex = Math.floor(Math.random() * validMoves.length);
+      const randomCard = validMoves[randomIndex];
+      
+      console.log(`[AUTO] Автоматический ход: ${randomCard.rank}${randomCard.suit}`);
+      
+      const cardIndex = currentPlayer.hand.findIndex(
+        c => c.suit === randomCard.suit && c.rank === randomCard.rank
+      );
+      
+      if (cardIndex > -1) {
+        currentPlayer.hand.splice(cardIndex, 1);
+        currentPlayer.cardCount = currentPlayer.hand.length;
+        this.state.piles[randomCard.suit].push(randomCard);
+        
+        if (currentPlayer.cardCount === 0) {
+          this.eliminationOrder.push(currentPlayer.id);
+          this.endGame(currentPlayer.id);
+          return;
+        }
+      }
+      
+      // 🔥 Уведомление об авто-ходе
+      this.broadcastNotification(`${currentPlayer.name}: автоматический ход`, 'info');
+      
       this.advanceTurn();
+    } else {
+      // Если вдруг ходов нет — пропускаем
+      this.handleSkipTurn(currentPlayer.id);
     }
+  }
+
+  private broadcastNotification(message: string, severity: 'info' | 'error' | 'success' = 'info'): void {
+    console.log(`[NOTIFICATION] ${message} (${severity})`);
+    this.onNotificationBroadcast(this, message, severity);
   }
 
   private endGame(winnerId: string): void {
     console.log('[GAME] Игра завершена, победитель:', winnerId);
     this.state.gameOver = true;
-    if (this.timerInterval) clearInterval(this.timerInterval);
+    
+    if (this.timerInterval) {
+      clearInterval(this.timerInterval);
+      this.timerInterval = null;
+    }
+    if (this.skipTimerInterval) {
+      clearInterval(this.skipTimerInterval);
+      this.skipTimerInterval = null;
+    }
     if (this.roomTimeout) clearTimeout(this.roomTimeout);
+    
+    // 🔥 Отправляем game_over всем игрокам
+    this.broadcastGameState();
   }
 
   getCurrentPlayer(): Player | undefined {
@@ -345,10 +439,12 @@ export class Room {
 
     player.status = 'left';
     
-    // Фиксируем порядок выбывания для ранжирования
     if (!this.eliminationOrder.includes(playerId)) {
       this.eliminationOrder.push(playerId);
     }
+
+    // Уведомление об выходе
+    this.broadcastNotification(`${player.name} покинул игру`, 'info');
 
     if (player.isOrganizer) {
       const activePlayers = this.state.players.filter(
@@ -363,7 +459,6 @@ export class Room {
     if (activePlayers.length > 0) {
       const currentPlayer = this.getCurrentActivePlayer();
       if (currentPlayer?.id === playerId) {
-        // Если текущий игрок вышел — сразу переключаем ход
         this.advanceTurn();
       }
     }
@@ -381,11 +476,20 @@ export class Room {
         this.endGame(lastPlayer.id);
       }
     }
+    
+    // Отправляем обновление после удаления игрока
+    this.broadcastGameState();
   }
 
-  // Очистка таймеров при удалении комнаты
   destroy(): void {
-    if (this.timerInterval) clearInterval(this.timerInterval);
+    if (this.timerInterval) {
+      clearInterval(this.timerInterval);
+      this.timerInterval = null;
+    }
+    if (this.skipTimerInterval) {
+      clearInterval(this.skipTimerInterval);
+      this.skipTimerInterval = null;
+    }
     if (this.roomTimeout) clearTimeout(this.roomTimeout);
     this.disconnectTimers.forEach(timer => clearTimeout(timer));
     this.disconnectTimers.clear();

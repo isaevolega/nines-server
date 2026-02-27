@@ -47,6 +47,7 @@ wss.on('connection', (ws) => {
 function handleMessage(ws: WebSocket, msg: ClientMessage) {
   const playerId = wsClients.get(ws);
   if (!playerId && msg.type !== 'join') return;
+  
   console.log('');
   console.log('Message', msg);
   console.log('============================');
@@ -79,7 +80,7 @@ function handleJoin(ws: WebSocket, msg: ClientMessage) {
   wsClients.set(ws, playerId);
 
   if (!msg.roomId) {
-    // Создаем новую комнату
+    // 🔥 Создаём новую комнату
     let roomId = generateRoomId();
     while (rooms.has(roomId)) {
       roomId = generateRoomId();
@@ -94,10 +95,18 @@ function handleJoin(ws: WebSocket, msg: ClientMessage) {
       isOrganizer: true,
       cardCount: 0
     };
-    room = new Room(roomId, organizer);
+    
+    // 🔥 Передаём callback'и при создании комнаты
+    room = new Room(
+      roomId, 
+      organizer, 
+      (room) => broadcastGameState(room),
+      (room, message, severity) => broadcastNotification(room, message, severity)
+    );
+    
     rooms.set(roomId, room);
   } else {
-    // Вход в существующую
+    // 🔥 Вход в существующую комнату
     room = rooms.get(msg.roomId);
     
     if (!room) {
@@ -128,22 +137,22 @@ function handleJoin(ws: WebSocket, msg: ClientMessage) {
 
   room.cancelDisconnect(playerId);
 
+  // 🔥 Отправляем успешный join новому игроку
   send(ws, {
     type: 'join_success',
     playerId: playerId,
     roomState: sanitizeState(room!.state, playerId)
   });
   
+  // 🔥 Уведомляем остальных о присоединении
   broadcast(room!, {
     type: 'notification',
     message: `${msg.playerName} присоединился`,
     severity: 'info'
   }, playerId);
 
-  broadcast(room!, {
-    type: 'game_state',
-    data: sanitizeState(room!.state, playerId!)
-  }, playerId);
+  // 🔥 Отправляем обновлённое состояние всем (кроме нового игрока — он уже получил в join_success)
+  broadcastGameStateExcept(room!, playerId);
 }
 
 function handleStartGame(ws: WebSocket, msg: ClientMessage) {
@@ -158,7 +167,7 @@ function handleStartGame(ws: WebSocket, msg: ClientMessage) {
     const activePlayers = room.state.players.filter(p => p.status === 'active');
     if (activePlayers.length >= 2) {
       room.startGame();
-      broadcast(room, { type: 'game_state', data: {} });
+      // 🔥 Room сам отправит game_state через callback после startGame
     } else {
       send(ws, { type: 'notification', message: 'Нужно минимум 2 игрока', severity: 'error' });
     }
@@ -168,7 +177,8 @@ function handleStartGame(ws: WebSocket, msg: ClientMessage) {
 function handlePlayCard(ws: WebSocket, msg: ClientMessage) {
   const playerId = wsClients.get(ws);
   if (!playerId || !msg.card) return;
-  console.log(msg.card);
+  
+  console.log('[WS] play_card:', msg.card);
 
   const room = Array.from(rooms.values()).find(r => 
     r.state.players.some(p => p.id === playerId)
@@ -178,6 +188,7 @@ function handlePlayCard(ws: WebSocket, msg: ClientMessage) {
     const result = room.playCard(playerId, msg.card as Card);
     if (result.success) {
       if (room.state.gameOver) {
+        // 🔥 Отправляем game_over всем
         broadcast(room, {
           type: 'game_over',
           winner: playerId,
@@ -190,17 +201,12 @@ function handlePlayCard(ws: WebSocket, msg: ClientMessage) {
             rooms.delete(room.id);
           }
         }, 120000);
-      } else {
-        // ИСПРАВЛЕНО: добавлен ключ 'data:'
-        broadcast(room, { 
-          type: 'game_state', 
-          data: {} 
-        });
       }
+      // 🔥 Room сам отправит game_state через callback после playCard
     } else {
       send(ws, { 
         type: 'notification', 
-        message: result.message || 'Ошибка хода', 
+        message: result.message || 'Неверный ход', 
         severity: 'error' 
       });
     }
@@ -217,16 +223,14 @@ function handleSkipTurn(ws: WebSocket, msg: ClientMessage) {
 
   if (room) {
     const result = room.skipTurn(playerId);
-    if (result.success) {
-      broadcast(room, { 
-        type: 'notification', 
-        message: 'Ход пропущен', 
-        severity: 'info' 
+    if (!result.success) {
+      send(ws, {
+        type: 'notification',
+        message: result.message || 'Ошибка пропуска',
+        severity: 'error'
       });
-      broadcast(room, { type: 'game_state', data: {} });
-    } else {
-      send(ws, { type: 'notification', message: result.message || 'Нельзя пропустить', severity: 'error' });
     }
+    // 🔥 Room сам отправит notification и game_state через callback
   }
 }
 
@@ -239,18 +243,11 @@ function handleLeave(ws: WebSocket, msg: ClientMessage) {
   );
 
   if (room) {
+    const playerName = room.state.players.find(p => p.id === playerId)?.name || 'Игрок';
     room.removePlayer(playerId);
-    broadcast(room, {
-      type: 'notification',
-      message: 'Игрок покинул игру',
-      severity: 'info'
-    });
-    broadcast(room, { type: 'game_state', data: {} });
-    
-    if (room.state.players.every(p => p.status === 'left')) {
-      rooms.delete(room.id);
-    }
+    // 🔥 Room сам отправит notification и game_state через callback
   }
+  
   wsClients.delete(ws);
   ws.close();
 }
@@ -262,12 +259,7 @@ function handleDisconnect(playerId: string) {
 
   if (room) {
     room.scheduleDisconnect(playerId, () => {
-      broadcast(room, {
-        type: 'notification',
-        message: 'Игрок потерял соединение',
-        severity: 'info'
-      });
-      broadcast(room, { type: 'game_state', data: {} });
+      // 🔥 Room сам отправит notification через callback
     });
   }
 }
@@ -278,37 +270,78 @@ function send(ws: WebSocket, msg: any) {
   }
 }
 
+// 🔥 Broadcast с исключением игрока (для простых уведомлений)
 function broadcast(room: Room, msg: any, excludeId?: string) {
+  console.log(`[BROADCAST] Тип: ${msg.type}, Исключаем: ${excludeId}`);
+  
   wss.clients.forEach(client => {
     const pId = wsClients.get(client);
     
-    if (!pId) {
-      return;
-    }
+    if (!pId) return;
     
     const player = room.state.players.find(p => p.id === pId);
     
-    if (!player) {
-      return;
-    }
+    if (!player) return;
     
-    if (client.readyState !== WebSocket.OPEN) {
-      return;
-    }
+    if (client.readyState !== WebSocket.OPEN) return;
     
-    if (pId === excludeId) {
-      return;
-    }
+    if (pId === excludeId) return;
     
-    if (msg.type === 'game_state') {
-      const sanitized = sanitizeState(room.state, pId);
-      send(client, {
-        type: 'game_state',
-        data: sanitized
-      });
-    } else {
-      send(client, msg);
-    }
+    console.log(`[BROADCAST] Отправка ${msg.type} игроку ${player.name}`);
+    send(client, msg);
+  });
+}
+
+// 🔥 Отправка game_state всем игрокам комнаты (вызывается из Room через callback)
+function broadcastGameState(room: Room) {
+  console.log(`[BROADCAST] Game state для комнаты ${room.id}`);
+  
+  wss.clients.forEach(client => {
+    const pId = wsClients.get(client);
+    if (!pId) return;
+    
+    const player = room.state.players.find(p => p.id === pId);
+    if (!player || client.readyState !== WebSocket.OPEN) return;
+    
+    send(client, {
+      type: 'game_state',
+      data: sanitizeState(room.state, pId)
+    });
+  });
+}
+
+// 🔥 Отправка game_state всем КРОМЕ указанного игрока
+function broadcastGameStateExcept(room: Room, excludeId: string) {
+  wss.clients.forEach(client => {
+    const pId = wsClients.get(client);
+    if (!pId || pId === excludeId) return;
+    
+    const player = room.state.players.find(p => p.id === pId);
+    if (!player || client.readyState !== WebSocket.OPEN) return;
+    
+    send(client, {
+      type: 'game_state',
+      data: sanitizeState(room.state, pId)
+    });
+  });
+}
+
+// 🔥 Отправка уведомления всем игрокам комнаты (вызывается из Room через callback)
+function broadcastNotification(room: Room, message: string, severity: string) {
+  console.log(`[BROADCAST] Уведомление: ${message} (${severity})`);
+  
+  wss.clients.forEach(client => {
+    const pId = wsClients.get(client);
+    if (!pId) return;
+    
+    const player = room.state.players.find(p => p.id === pId);
+    if (!player || client.readyState !== WebSocket.OPEN) return;
+    
+    send(client, {
+      type: 'notification',
+      message: message,
+      severity: severity
+    });
   });
 }
 
@@ -317,7 +350,7 @@ function sanitizeState(state: RoomState, viewerId: string): any {
   const currentPlayer = activePlayers[state.turnIndex];
   const viewer = state.players.find(p => p.id === viewerId);
 
-  const result = {
+  return {
     roomId: state.roomId,
     players: state.players.map(p => ({
       id: p.id,
@@ -340,7 +373,6 @@ function sanitizeState(state: RoomState, viewerId: string): any {
     gameOver: state.gameOver,
     firstMoveAutoPlayed: state.firstMoveAutoPlayed
   };
-  return result;
 }
 
 server.listen(PORT, () => {
