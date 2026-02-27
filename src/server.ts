@@ -136,6 +136,11 @@ function handleJoin(ws: WebSocket, msg: ClientMessage) {
     message: `${msg.playerName} присоединился`,
     severity: 'info'
   }, playerId);
+
+  broadcast(room!, {
+    type: 'game_state',
+    data: sanitizeState(room!.state, playerId!)
+  }, playerId);
 }
 
 function handleStartGame(ws: WebSocket, msg: ClientMessage) {
@@ -160,13 +165,18 @@ function handleStartGame(ws: WebSocket, msg: ClientMessage) {
 function handlePlayCard(ws: WebSocket, msg: ClientMessage) {
   const playerId = wsClients.get(ws);
   if (!playerId || !msg.card) return;
+  console.log(`[DEBUG] play_card от ${playerId}:`, msg.card); 
 
   const room = Array.from(rooms.values()).find(r => 
     r.state.players.some(p => p.id === playerId)
   );
 
+  console.log(`[DEBUG] Комната найдена:`, room?.id);
+
   if (room) {
     const result = room.playCard(playerId, msg.card as Card);
+    console.log(`[DEBUG] Результат хода:`, result);
+    console.log(`[DEBUG] Стопки после хода:`, JSON.stringify(room.state.piles)); 
     
     if (result.success) {
       if (room.state.gameOver) {
@@ -186,7 +196,7 @@ function handlePlayCard(ws: WebSocket, msg: ClientMessage) {
         // ИСПРАВЛЕНО: добавлен ключ 'data:'
         broadcast(room, { 
           type: 'game_state', 
-          data: sanitizeState(room.state, playerId) 
+          data: {} 
         });
       }
     } else {
@@ -271,19 +281,45 @@ function send(ws: WebSocket, msg: any) {
 }
 
 function broadcast(room: Room, msg: any, excludeId?: string) {
+  console.log(`[BROADCAST] Тип: ${msg.type}, Исключаем: ${excludeId}`);  // ← Лог
+  
   wss.clients.forEach(client => {
     const pId = wsClients.get(client);
+    
+    if (!pId) {
+      console.log(`[BROADCAST] Пропуск: нет playerId`);  // ← Лог
+      return;
+    }
+    
     const player = room.state.players.find(p => p.id === pId);
     
-    if (client.readyState === WebSocket.OPEN && player && pId !== excludeId) {
-      if (msg.type === 'game_state') {
-        send(client, {
-          type: 'game_state',
-          data: sanitizeState(room.state, pId!)
-        });
-      } else {
-        send(client, msg);
-      }
+    if (!player) {
+      console.log(`[BROADCAST] Пропуск: игрок не найден в комнате`);  // ← Лог
+      return;
+    }
+    
+    if (client.readyState !== WebSocket.OPEN) {
+      console.log(`[BROADCAST] Пропуск: сокет не открыт`);  // ← Лог
+      return;
+    }
+    
+    if (pId === excludeId) {
+      console.log(`[BROADCAST] Пропуск: исключён ${pId}`);  // ← Лог
+      return;
+    }
+    
+    console.log(`[BROADCAST] Отправка ${msg.type} игроку ${player.name}`);  // ← Лог
+    
+    if (msg.type === 'game_state') {
+      const sanitized = sanitizeState(room.state, pId);
+      console.log(`[BROADCAST] Отправляем centerPiles:`, JSON.stringify(sanitized.centerPiles));  // ← Лог
+      
+      send(client, {
+        type: 'game_state',
+        data: sanitized
+      });
+    } else {
+      send(client, msg);
     }
   });
 }
@@ -291,8 +327,9 @@ function broadcast(room: Room, msg: any, excludeId?: string) {
 function sanitizeState(state: RoomState, viewerId: string): any {
   const activePlayers = state.players.filter(p => p.status === 'active');
   const currentPlayer = activePlayers[state.turnIndex];
+  const viewer = state.players.find(p => p.id === viewerId);
 
-  return {
+  const result = {
     roomId: state.roomId,
     players: state.players.map(p => ({
       id: p.id,
@@ -302,16 +339,22 @@ function sanitizeState(state: RoomState, viewerId: string): any {
       status: p.status,
       isOrganizer: p.isOrganizer
     })),
+    myHand: viewer?.id === viewerId 
+      ? viewer?.hand.map(c => ({ suit: c.suit, rank: c.rank })) 
+      : [],
     centerPiles: Object.fromEntries(
       Object.entries(state.piles).map(([suit, cards]) => [
         suit,
-        cards.map(c => c.rank)
+        [...cards.map(c => c.rank)]
       ])
     ),
     timer: state.timer,
     gameOver: state.gameOver,
     firstMoveAutoPlayed: state.firstMoveAutoPlayed
   };
+  
+  console.log(`[SANITIZE] centerPiles для ${viewerId}:`, JSON.stringify(result.centerPiles));  // ← Лог
+  return result;
 }
 
 server.listen(PORT, () => {

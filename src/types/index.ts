@@ -90,3 +90,20 @@ export type OutgoingMessage =
   | GameStateMessage 
   | NotificationMessage 
   | GameOverMessage;
+
+export interface GameStateData {
+  roomId: string;
+  players: Array<{
+    id: string;
+    name: string;
+    cardCount: number;
+    isCurrentTurn: boolean;
+    status: string;
+    isOrganizer: boolean;
+  }>;
+  myHand?: Array<{ suit: string; rank: string }>; // Только для владельца
+  centerPiles: Record<string, string[]>;
+  timer: number;
+  gameOver: boolean;
+  firstMoveAutoPlayed: boolean;
+}
