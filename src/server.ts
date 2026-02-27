@@ -47,6 +47,9 @@ wss.on('connection', (ws) => {
 function handleMessage(ws: WebSocket, msg: ClientMessage) {
   const playerId = wsClients.get(ws);
   if (!playerId && msg.type !== 'join') return;
+  console.log('');
+  console.log('Message', msg);
+  console.log('============================');
 
   switch (msg.type) {
     case 'join':
@@ -165,6 +168,7 @@ function handleStartGame(ws: WebSocket, msg: ClientMessage) {
 function handlePlayCard(ws: WebSocket, msg: ClientMessage) {
   const playerId = wsClients.get(ws);
   if (!playerId || !msg.card) return;
+  console.log(msg.card);
 
   const room = Array.from(rooms.values()).find(r => 
     r.state.players.some(p => p.id === playerId)
