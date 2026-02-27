@@ -1,5 +1,4 @@
 // src/game/Room.ts
-import { v4 as uuidv4 } from 'uuid';
 import { Card, Player, RoomState, Suit, PlayerStatus } from '../types';
 import { createDeck, shuffleDeck } from './Deck';
 import { getValidMoves, isValidMove } from './Validator';
@@ -8,7 +7,9 @@ export class Room {
   public id: string;
   public state: RoomState;
   private timerInterval: NodeJS.Timeout | null = null;
-  private disconnectTimers: Map<string, NodeJS.Timeout> = new Map(); // playerId -> timeout
+  private disconnectTimers: Map<string, NodeJS.Timeout> = new Map();
+  private roomTimeout: NodeJS.Timeout | null = null; // Таймер жизни комнаты (1 час)
+  private eliminationOrder: string[] = []; // Порядок выбывания игроков (для ранжирования)
 
   constructor(id: string, organizer: Player) {
     this.id = id;
@@ -22,6 +23,57 @@ export class Room {
       firstMoveAutoPlayed: false,
       createdAt: Date.now(),
     };
+
+    // Запускаем таймер удаления комнаты через 1 час
+    this.startRoomTimeout();
+  }
+
+  private startRoomTimeout(): void {
+    const ONE_HOUR = 60 * 60 * 1000;
+    this.roomTimeout = setTimeout(() => {
+      this.forceEndGame();
+    }, ONE_HOUR);
+  }
+
+  private forceEndGame(): void {
+    if (this.state.gameOver) return;
+    
+    this.state.gameOver = true;
+    if (this.timerInterval) clearInterval(this.timerInterval);
+    if (this.roomTimeout) clearTimeout(this.roomTimeout);
+
+    // Формируем ранжирование по текущему состоянию
+    const rankings = this.calculateRankings();
+    
+    // Сервер должен отправить game_over (вызывается из server.ts через callback)
+    // Здесь только логика
+  }
+
+  public getRankings(): { playerId: string; place: number }[] {
+    return this.calculateRankings();
+  }
+
+  private calculateRankings(): { playerId: string; place: number }[] {
+    const activePlayers = this.state.players.filter(p => p.status !== 'left');
+    
+    // Сортировка: сначала по количеству карт (меньше = лучше), затем по порядку выбывания
+    const sorted = [...activePlayers].sort((a, b) => {
+      if (a.cardCount !== b.cardCount) {
+        return a.cardCount - b.cardCount;
+      }
+      // При равенстве карт: кто раньше выбыл (меньше индекс в eliminationOrder) — тот лучше
+      const aIndex = this.eliminationOrder.indexOf(a.id);
+      const bIndex = this.eliminationOrder.indexOf(b.id);
+      if (aIndex !== -1 && bIndex !== -1) return aIndex - bIndex;
+      if (aIndex !== -1) return 1;
+      if (bIndex !== -1) return -1;
+      return 0;
+    });
+
+    return sorted.map((player, index) => ({
+      playerId: player.id,
+      place: index + 1
+    }));
   }
 
   addPlayer(player: Player): boolean {
@@ -87,8 +139,8 @@ export class Room {
     this.state.gameOver = false;
     this.state.firstMoveAutoPlayed = false;
     this.state.turnIndex = 0;
+    this.eliminationOrder = []; // Сброс порядка выбывания
 
-    // Авто-ход 9♦
     this.executeFirstAutoMove();
     
     return true;
@@ -133,23 +185,21 @@ export class Room {
       return { success: false, message: 'Неверный ход' };
     }
 
-    // Удаляем из руки
     const cardIndex = currentPlayer.hand.findIndex(c => c.suit === card.suit && c.rank === card.rank);
     if (cardIndex === -1) return { success: false, message: 'Карты нет в руке' };
 
     currentPlayer.hand.splice(cardIndex, 1);
     currentPlayer.cardCount = currentPlayer.hand.length;
 
-    // Кладем в стопку
     this.state.piles[card.suit].push(card);
 
     // Проверка победы
     if (currentPlayer.cardCount === 0) {
+      this.eliminationOrder.push(playerId); // Фиксируем победителя первым
       this.endGame(currentPlayer.id);
       return { success: true };
     }
 
-    // Передача хода
     this.state.turnIndex = (this.state.turnIndex + 1) % activePlayers.length;
     this.startTurnTimer();
 
@@ -230,7 +280,7 @@ export class Room {
   private endGame(winnerId: string): void {
     this.state.gameOver = true;
     if (this.timerInterval) clearInterval(this.timerInterval);
-    // Логика ранжирования остальных игроков по количеству карт
+    if (this.roomTimeout) clearTimeout(this.roomTimeout);
   }
 
   getCurrentPlayer(): Player | undefined {
@@ -242,10 +292,13 @@ export class Room {
     const player = this.state.players.find(p => p.id === playerId);
     if (!player) return;
 
-    // Помечаем как вышедшего
     player.status = 'left';
+    
+    // Фиксируем порядок выбывания для ранжирования
+    if (!this.eliminationOrder.includes(playerId)) {
+      this.eliminationOrder.push(playerId);
+    }
 
-    // Если организатор вышел — передаем права первому активному игроку
     if (player.isOrganizer) {
       const activePlayers = this.state.players.filter(
         p => p.id !== playerId && p.status === 'active'
@@ -255,7 +308,6 @@ export class Room {
       }
     }
 
-    // Если текущий ход этого игрока — передаем ход следующему
     const activePlayers = this.state.players.filter(p => p.status === 'active');
     if (activePlayers.length > 0) {
       const currentPlayer = activePlayers[this.state.turnIndex];
@@ -265,10 +317,26 @@ export class Room {
       }
     }
 
-    // Отменяем таймер дисконнекта если был
     if (this.disconnectTimers.has(playerId)) {
       clearTimeout(this.disconnectTimers.get(playerId)!);
       this.disconnectTimers.delete(playerId);
     }
+
+    // Если остался 1 игрок — объявляем победителем
+    if (activePlayers.length === 1 && this.state.players.some(p => p.hand.length > 0)) {
+      const lastPlayer = activePlayers[0];
+      if (!this.state.gameOver) {
+        this.eliminationOrder.push(lastPlayer.id);
+        this.endGame(lastPlayer.id);
+      }
+    }
+  }
+
+  // Очистка таймеров при удалении комнаты
+  destroy(): void {
+    if (this.timerInterval) clearInterval(this.timerInterval);
+    if (this.roomTimeout) clearTimeout(this.roomTimeout);
+    this.disconnectTimers.forEach(timer => clearTimeout(timer));
+    this.disconnectTimers.clear();
   }
 }

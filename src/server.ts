@@ -1,9 +1,10 @@
 // src/server.ts
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
+import { randomUUID } from 'crypto';
 import { Room } from './game/Room';
 import { ClientMessage, Player, Card, RoomState } from './types';
-import { v4 as uuidv4 } from 'uuid';
+import { generateRoomId } from './utils/idGenerator';
 
 const PORT = process.env.PORT || 10000;
 const rooms = new Map<string, Room>();
@@ -67,14 +68,20 @@ function handleMessage(ws: WebSocket, msg: ClientMessage) {
 }
 
 function handleJoin(ws: WebSocket, msg: ClientMessage) {
-  if (!msg.roomId || !msg.playerName) return;
+  if (!msg.playerName) return;
 
-  let room = rooms.get(msg.roomId);
-  const playerId = msg.playerId || uuidv4();
+  let room: Room | undefined;
+  const playerId = msg.playerId || randomUUID();
   
   wsClients.set(ws, playerId);
 
-  if (!room) {
+  if (!msg.roomId) {
+    // Создаем новую комнату
+    let roomId = generateRoomId();
+    while (rooms.has(roomId)) {
+      roomId = generateRoomId();
+    }
+    
     const organizer: Player = {
       id: playerId,
       name: msg.playerName,
@@ -84,22 +91,25 @@ function handleJoin(ws: WebSocket, msg: ClientMessage) {
       isOrganizer: true,
       cardCount: 0
     };
-    room = new Room(msg.roomId, organizer);
-    rooms.set(msg.roomId, room);
+    room = new Room(roomId, organizer);
+    rooms.set(roomId, room);
   } else {
-    if (room.state.gameOver) {
-      send(ws, { type: 'notification', message: 'Игра уже завершилась', severity: 'error' });
+    // Вход в существующую
+    room = rooms.get(msg.roomId);
+    
+    if (!room) {
+      send(ws, { type: 'notification', message: 'Комната не найдена', severity: 'error' });
       return;
     }
     
-    // Проверка на присоединение к начатой игре (если игры нет в лобби)
-    // По ТЗ: Нельзя присоединиться к комнате, в которой игра уже началась
-    // Но у нас флаг gameOver. Если игра идет (cards dealt), но gameOver=false, то нужно проверить.
-    // Упростим: если есть карты у игроков — игра началась.
-    const gameStarted = room.state.players.some(p => p.hand.length > 0);
-    if (gameStarted) {
-       send(ws, { type: 'notification', message: 'Игра уже началась', severity: 'error' });
-       return;
+    if (room.state.gameOver || room.state.players.some(p => p.hand.length > 0)) {
+      send(ws, { type: 'notification', message: 'Игра уже началась', severity: 'error' });
+      return;
+    }
+
+    if (room.state.players.length >= 4) {
+      send(ws, { type: 'notification', message: 'Комната заполнена', severity: 'error' });
+      return;
     }
 
     room.addPlayer({
@@ -113,7 +123,6 @@ function handleJoin(ws: WebSocket, msg: ClientMessage) {
     });
   }
 
-  // Отмена дисконнекта если был
   room.cancelDisconnect(playerId);
 
   send(ws, {
@@ -158,10 +167,34 @@ function handlePlayCard(ws: WebSocket, msg: ClientMessage) {
 
   if (room) {
     const result = room.playCard(playerId, msg.card as Card);
+    
     if (result.success) {
-      broadcast(room, { type: 'game_state', data: {} });
+      if (room.state.gameOver) {
+        broadcast(room, {
+          type: 'game_over',
+          winner: playerId,
+          rankings: room.getRankings()
+        });
+        
+        setTimeout(() => {
+          if (rooms.has(room.id)) {
+            room.destroy();
+            rooms.delete(room.id);
+          }
+        }, 120000);
+      } else {
+        // ИСПРАВЛЕНО: добавлен ключ 'data:'
+        broadcast(room, { 
+          type: 'game_state', 
+          data: sanitizeState(room.state, playerId) 
+        });
+      }
     } else {
-      send(ws, { type: 'notification', message: result.message || 'Ошибка хода', severity: 'error' });
+      send(ws, { 
+        type: 'notification', 
+        message: result.message || 'Ошибка хода', 
+        severity: 'error' 
+      });
     }
   }
 }
@@ -206,7 +239,6 @@ function handleLeave(ws: WebSocket, msg: ClientMessage) {
     });
     broadcast(room, { type: 'game_state', data: {} });
     
-    // Если комната пустая — удаляем
     if (room.state.players.every(p => p.status === 'left')) {
       rooms.delete(room.id);
     }
@@ -221,7 +253,6 @@ function handleDisconnect(playerId: string) {
   );
 
   if (room) {
-    // Запускаем таймер 10 сек перед помечанием offline
     room.scheduleDisconnect(playerId, () => {
       broadcast(room, {
         type: 'notification',
@@ -274,7 +305,7 @@ function sanitizeState(state: RoomState, viewerId: string): any {
     centerPiles: Object.fromEntries(
       Object.entries(state.piles).map(([suit, cards]) => [
         suit,
-        cards.map(c => c.rank) // Только ранги для клиента
+        cards.map(c => c.rank)
       ])
     ),
     timer: state.timer,
