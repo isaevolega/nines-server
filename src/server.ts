@@ -165,19 +165,13 @@ function handleStartGame(ws: WebSocket, msg: ClientMessage) {
 function handlePlayCard(ws: WebSocket, msg: ClientMessage) {
   const playerId = wsClients.get(ws);
   if (!playerId || !msg.card) return;
-  console.log(`[DEBUG] play_card от ${playerId}:`, msg.card); 
 
   const room = Array.from(rooms.values()).find(r => 
     r.state.players.some(p => p.id === playerId)
   );
 
-  console.log(`[DEBUG] Комната найдена:`, room?.id);
-
   if (room) {
     const result = room.playCard(playerId, msg.card as Card);
-    console.log(`[DEBUG] Результат хода:`, result);
-    console.log(`[DEBUG] Стопки после хода:`, JSON.stringify(room.state.piles)); 
-    
     if (result.success) {
       if (room.state.gameOver) {
         broadcast(room, {
@@ -281,39 +275,29 @@ function send(ws: WebSocket, msg: any) {
 }
 
 function broadcast(room: Room, msg: any, excludeId?: string) {
-  console.log(`[BROADCAST] Тип: ${msg.type}, Исключаем: ${excludeId}`);  // ← Лог
-  
   wss.clients.forEach(client => {
     const pId = wsClients.get(client);
     
     if (!pId) {
-      console.log(`[BROADCAST] Пропуск: нет playerId`);  // ← Лог
       return;
     }
     
     const player = room.state.players.find(p => p.id === pId);
     
     if (!player) {
-      console.log(`[BROADCAST] Пропуск: игрок не найден в комнате`);  // ← Лог
       return;
     }
     
     if (client.readyState !== WebSocket.OPEN) {
-      console.log(`[BROADCAST] Пропуск: сокет не открыт`);  // ← Лог
       return;
     }
     
     if (pId === excludeId) {
-      console.log(`[BROADCAST] Пропуск: исключён ${pId}`);  // ← Лог
       return;
     }
     
-    console.log(`[BROADCAST] Отправка ${msg.type} игроку ${player.name}`);  // ← Лог
-    
     if (msg.type === 'game_state') {
       const sanitized = sanitizeState(room.state, pId);
-      console.log(`[BROADCAST] Отправляем centerPiles:`, JSON.stringify(sanitized.centerPiles));  // ← Лог
-      
       send(client, {
         type: 'game_state',
         data: sanitized
@@ -352,8 +336,6 @@ function sanitizeState(state: RoomState, viewerId: string): any {
     gameOver: state.gameOver,
     firstMoveAutoPlayed: state.firstMoveAutoPlayed
   };
-  
-  console.log(`[SANITIZE] centerPiles для ${viewerId}:`, JSON.stringify(result.centerPiles));  // ← Лог
   return result;
 }
 
